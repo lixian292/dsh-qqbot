@@ -1445,6 +1445,17 @@ export function apply(ctx) {
   //    列出"已有 dsh 会话"的工作区目录 + 会话数, 供账号 cwd 挑选(避免指到空目录/错目录)。
   //    dsh 把会话按工作区路径归到 ~/.dsh/sessions/--<编码路径>--, 目录内 *.zstd = 会话数。
   /** dsh session 目录名 → 工作区绝对路径(~XXXX 为 UTF-16 code unit, - 为段分隔, 首段补盘符冒号) */
+  /**
+   * dsh session 目录名 → 工作区绝对路径
+   *
+   * ⚠️ dsh 转义目录名时，'-' 既是路径分隔符、也是路径本身的合法字符
+   *   （例：D:\agent-sandbox → --D-agent-sandbox--），单靠 split('-') 无法区分，
+   *   会把 D:\agent-sandbox 还原成 D:\agent\sandbox，导致：
+   *   · 扩展面板的「当前工作区 / 内置目录 / 扩展包目录」全部指向不存在的路径
+   *   · 内置扩展计数恒为 0；工作区选择器列出错误路径
+   * 这里枚举 '-' 与分隔符的组合，取磁盘上真实存在的那个；都不存在时保持旧行为。
+   * 组合数上限 2^10，避免异常目录名把 CPU 打满。
+   */
   function decodeSessionDirName(name) {
     try {
       const segs = name.split('-').filter(Boolean);
@@ -1453,11 +1464,37 @@ export function apply(ctx) {
       // 首段是盘符(D / C) → 补冒号; 其余段拼回路径分隔
       // ① Windows 盘符：首段是单个字母 → X:\a\b
       if (/^[A-Za-z]$/.test(decoded[0])) {
-        const sep = '\\';
-        return decoded[0] + ':' + (decoded.length > 1 ? sep + decoded.slice(1).join(sep) : sep);
+        const head = decoded[0] + ':';
+        const rest = decoded.slice(1);
+        if (rest.length === 0) return head + '\\';
+        const fallback = head + '\\' + rest.join('\\');
+        const gaps = rest.length - 1;
+        if (gaps > 10) return fallback;
+        const total = 1 << gaps;
+        for (let mask = 0; mask < total; mask++) {
+          let p = head;
+          for (let i = 0; i < rest.length; i++) {
+            const sep = i === 0 ? '\\' : (((mask >> (i - 1)) & 1) ? '\\' : '-');
+            p += sep + rest[i];
+          }
+          if (existsSync(p)) return p;
+        }
+        return fallback;
       }
-      // ② POSIX（Linux/Android）：编码时丢了前导 '/'，这里补回来
-      return '/' + decoded.join('/');
+      // ② POSIX（Linux/Android）：编码时丢了前导 '/'，这里补回来；同样要消解 '-' 歧义
+      const fallback = '/' + decoded.join('/');
+      const gaps = decoded.length - 1;
+      if (gaps > 10) return fallback;
+      const total = 1 << gaps;
+      for (let mask = 0; mask < total; mask++) {
+        let p = '';
+        for (let i = 0; i < decoded.length; i++) {
+          const sep = i === 0 ? '' : (((mask >> (i - 1)) & 1) ? '/' : '-');
+          p += sep + decoded[i];
+        }
+        if (existsSync('/' + p)) return '/' + p;
+      }
+      return fallback;
     } catch { return ''; }
   }
   route(ctx, 'GET', '/api/qqbot-settings/workspaces', async (_req, res) => {
